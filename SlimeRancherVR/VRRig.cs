@@ -6,8 +6,10 @@ namespace SlimeRancherVR
 {
     /// <summary>
     /// Renders the game's main camera once per eye into RenderTextures and submits them to the
-    /// OpenVR compositor. The headset pose is applied on top of the game's own camera, so
-    /// mouse/gamepad look and movement keep working; head tracking only adds to them.
+    /// OpenVR compositor. The headset pose is applied on top of a base orientation:
+    ///  - hand-aim mode: a body yaw we own (snap-turn), while the game's camera is steered to the
+    ///    right controller's direction (see <see cref="HandAim"/>);
+    ///  - otherwise: the game's own camera rotation (mouse/gamepad look).
     /// </summary>
     internal class VRRig : MonoBehaviour
     {
@@ -26,6 +28,12 @@ namespace SlimeRancherVR
         private Vector3 headPos;
         private Quaternion headRot = Quaternion.identity;
         private bool rendered;
+
+        private ControllerInput input;
+        private HandAim aim;
+        private bool handAimOn;
+        private float bodyYaw;
+        private Transform leftModel, rightModel;
 
         private void Start()
         {
@@ -48,6 +56,15 @@ namespace SlimeRancherVR
                 OpenVRSession.ToUnity(OpenVRSession.System.GetEyeToHeadTransform(eye),
                     out eyeOffset[i], out eyeRot[i]);
             }
+
+            input = new ControllerInput(Plugin.Instance.Config);
+            aim = new HandAim();
+            handAimOn = Plugin.HandAim.Value;
+            if (Plugin.ShowControllers.Value)
+            {
+                leftModel = MakeModel("VR Left Hand", false);
+                rightModel = MakeModel("VR Right Hand", true);
+            }
             StartCoroutine(SubmitLoop());
         }
 
@@ -63,6 +80,7 @@ namespace SlimeRancherVR
                 gameClear = source.clearFlags;
                 source.cullingMask = 0;
                 source.clearFlags = CameraClearFlags.Nothing;
+                bodyYaw = HandAim.YawOf(source.transform.forward);
             }
 
             // Blocks until the compositor wants a new frame. Turn off the game's V-Sync.
@@ -72,10 +90,20 @@ namespace SlimeRancherVR
             OpenVRSession.ToUnity(hmd.mDeviceToAbsoluteTracking, out headPos, out headRot);
 
             if (!haveOrigin || Input.GetKeyDown(Plugin.RecenterKey.Value)) Recenter();
+            if (Input.GetKeyDown(Plugin.HandAimKey.Value)) ToggleHandAim();
+
+            bool focused = Application.isFocused;
+            input.Update(focused);
+            if (handAimOn) bodyYaw += input.TurnRequest;
 
             Quaternion invYaw = Quaternion.Inverse(originYaw);
             Vector3 relPos = invYaw * (headPos - originPos);
             Quaternion relRot = invYaw * headRot;
+            Quaternion baseRot = handAimOn ? Quaternion.Euler(0, bodyYaw, 0) : source.transform.rotation;
+            Vector3 basePos = source.transform.position;
+
+            UpdateHand(input.LeftDevice, leftModel, baseRot, basePos, invYaw, false, focused);
+            UpdateHand(input.RightDevice, rightModel, baseRot, basePos, invYaw, true, focused);
 
             for (int i = 0; i < 2; i++)
             {
@@ -91,12 +119,31 @@ namespace SlimeRancherVR
                     OpenVRSession.System.GetProjectionMatrix(eye, source.nearClipPlane, source.farClipPlane));
 
                 Transform t = cam.transform;
-                Quaternion baseRot = source.transform.rotation;
                 t.rotation = baseRot * relRot * eyeRot[i];
-                t.position = source.transform.position + baseRot * (relPos + relRot * eyeOffset[i]);
+                t.position = basePos + baseRot * (relPos + relRot * eyeOffset[i]);
                 cam.Render();
             }
             rendered = true;
+        }
+
+        /// <summary>Position a controller model; for the right hand also drive hand aiming.</summary>
+        private void UpdateHand(uint dev, Transform model, Quaternion baseRot, Vector3 basePos,
+                                Quaternion invYaw, bool isAimHand, bool focused)
+        {
+            bool valid = dev != OpenVR.k_unTrackedDeviceIndexInvalid && dev < poses.Length
+                         && poses[dev].bPoseIsValid && poses[dev].bDeviceIsConnected;
+            if (model != null) model.gameObject.SetActive(valid);
+            if (!valid) return;
+
+            Vector3 pos; Quaternion rot;
+            OpenVRSession.ToUnity(poses[dev].mDeviceToAbsoluteTracking, out pos, out rot);
+            Quaternion worldRot = baseRot * (invYaw * rot);
+            Vector3 worldPos = basePos + baseRot * (invYaw * (pos - originPos));
+            if (model != null) { model.rotation = worldRot; model.position = worldPos; }
+
+            // Only steer the camera while the game has the cursor locked (i.e. in gameplay, not menus).
+            if (isAimHand && handAimOn && focused && Cursor.lockState == CursorLockMode.Locked)
+                aim.Update(source, worldRot * Quaternion.Euler(Plugin.AimPitchOffset.Value, 0, 0) * Vector3.forward);
         }
 
         private void Recenter()
@@ -104,6 +151,43 @@ namespace SlimeRancherVR
             originPos = headPos;
             originYaw = Quaternion.Euler(0, headRot.eulerAngles.y, 0);
             haveOrigin = true;
+        }
+
+        private void ToggleHandAim()
+        {
+            handAimOn = !handAimOn;
+            aim.Reset();
+            if (handAimOn && source != null) bodyYaw = HandAim.YawOf(source.transform.forward);
+            Plugin.Log.LogInfo("Hand aim " + (handAimOn ? "on" : "off"));
+        }
+
+        private static Transform MakeModel(string name, bool withPointer)
+        {
+            Shader shader = Shader.Find("Sprites/Default"); // always-included shader; others may be stripped
+            if (shader == null) return null;
+
+            var go = GameObject.CreatePrimitive(PrimitiveType.Cube);
+            go.name = name;
+            DestroyImmediate(go.GetComponent<Collider>()); // must not interfere with game physics
+            go.transform.localScale = new Vector3(0.04f, 0.04f, 0.12f);
+            var mat = new Material(shader) { color = new Color(0.9f, 0.9f, 0.95f) };
+            go.GetComponent<Renderer>().material = mat;
+            DontDestroyOnLoad(go);
+
+            if (withPointer)
+            {
+                var line = new GameObject("Aim line");
+                line.transform.SetParent(go.transform, false);
+                line.transform.localScale = new Vector3(1 / 0.04f, 1 / 0.04f, 1 / 0.12f); // undo parent scale
+                var lr = line.AddComponent<LineRenderer>();
+                lr.useWorldSpace = false;
+                lr.positionCount = 2;
+                lr.SetPosition(0, Vector3.zero);
+                lr.SetPosition(1, new Vector3(0, 0, 6f));
+                lr.startWidth = lr.endWidth = 0.004f;
+                lr.material = new Material(shader) { color = new Color(0.3f, 0.9f, 1f, 0.8f) };
+            }
+            return go.transform;
         }
 
         private IEnumerator SubmitLoop()
@@ -127,6 +211,16 @@ namespace SlimeRancherVR
                 }
                 OpenVRSession.Compositor.PostPresentHandoff();
             }
+        }
+
+        private void OnApplicationFocus(bool focused)
+        {
+            if (!focused && input != null) input.ReleaseAll();
+        }
+
+        private void OnDestroy()
+        {
+            if (input != null) input.ReleaseAll();
         }
 
         private void OnGUI()
