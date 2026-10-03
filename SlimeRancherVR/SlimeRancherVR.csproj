@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net35</TargetFramework>
+    <LangVersion>9.0</LangVersion>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <AssemblyName>SlimeRancherVR</AssemblyName>
+    <RootNamespace>SlimeRancherVR</RootNamespace>
+    <!-- Override on the command line: dotnet build -p:GameDir="C:\...\Slime Rancher\" -->
+    <GameDir Condition="'$(GameDir)' == ''">C:\Program Files (x86)\Steam\steamapps\common\Slime Rancher\</GameDir>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="all" />
+    <Reference Include="BepInEx">
+      <HintPath>$(GameDir)BepInEx\core\BepInEx.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="$(GameDir)SlimeRancher_Data\Managed\UnityEngine*.dll">
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+  <!-- Copy the plugin and OpenVR native library into the game folder after each build. -->
+  <Target Name="Deploy" AfterTargets="Build" Condition="Exists('$(GameDir)BepInEx')">
+    <Copy SourceFiles="$(OutputPath)SlimeRancherVR.dll" DestinationFolder="$(GameDir)BepInEx\plugins" />
+    <Copy SourceFiles="ThirdParty\openvr_api.dll" DestinationFolder="$(GameDir)SlimeRancher_Data\Plugins" />
+  </Target>
+</Project>
